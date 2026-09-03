@@ -5,15 +5,15 @@ import aiohttp
 from bs4 import BeautifulSoup
 import discord
 from discord.ext import commands, tasks
+from openai import AsyncOpenAI
 
 HUTCH_URL = "https://www.hutch.io/our-games/f1-clash/patch-notes/"
 STATE_FILE = "state.json"
-CHECK_MINUTES = 10
+CHECK_MINUTES = int(os.getenv("CHECK_MINUTES", "10"))
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 
 def load_state():
     try:
@@ -22,326 +22,214 @@ def load_state():
     except FileNotFoundError:
         return {"last_url": ""}
 
-
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-
 async def get_html(url):
     timeout = aiohttp.ClientTimeout(total=30)
-
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/142.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
     }
-
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, headers=headers) as response:
             response.raise_for_status()
             return await response.text()
 
-
-async def find_latest_hutch_article():
-    html = await get_html(HUTCH_URL)
+def find_articles(html):
     soup = BeautifulSoup(html, "html.parser")
-
-    articles = []
-
-    for link in soup.find_all("a", href=True):
-
-        href = link["href"]
-
+    found, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
         if href.startswith("/"):
             href = "https://www.hutch.io" + href
-
-        if "/our-games/f1-clash/patch-notes/" not in href:
+        if "/our-games/f1-clash/patch-notes/" not in href or href.rstrip("/") == HUTCH_URL.rstrip("/"):
             continue
+        title = " ".join(a.get_text(" ", strip=True).split())
+        if href not in seen:
+            seen.add(href)
+            found.append((title, href))
+    for href in re.findall(r'https?://(?:www\.)?hutch\.io/our-games/f1-clash/patch-notes/[^"\'<>\s]+', html):
+        href = href.rstrip("\\")
+        if href.rstrip("/") != HUTCH_URL.rstrip("/") and href not in seen:
+            seen.add(href)
+            found.append(("", href))
+    return found
 
-        if href.rstrip("/") == HUTCH_URL.rstrip("/"):
-            continue
+def update_number(title, url):
+    m = re.search(r"update[-\s]*(\d+)", f"{title} {url}", re.I)
+    return int(m.group(1)) if m else -1
 
-        title = " ".join(
-            link.get_text(" ", strip=True).split()
-        )
-
-        # On récupère le numéro de l'Update dans le titre ou l'URL.
-        match = re.search(
-            r"(?:update[-\s]*)(\d+(?:\.\d+)?)",
-            title + " " + href,
-            re.IGNORECASE
-        )
-
-        if match:
-            try:
-                number = float(match.group(1))
-            except ValueError:
-                number = 0
-
-            articles.append({
-                "number": number,
-                "title": title,
-                "url": href
-            })
-
+async def latest_article():
+    html = await get_html(HUTCH_URL)
+    articles = find_articles(html)
     if not articles:
-        raise Exception(
-            "Aucun article F1 Clash trouvé sur la page Hutch."
-        )
+        raise RuntimeError("Aucun article Hutch trouvé.")
+    articles.sort(key=lambda x: update_number(*x), reverse=True)
+    title, url = articles[0]
+    if not title:
+        title = url.rstrip("/").split("/")[-1].replace("-", " ").title()
+    return {"title": title, "url": url, "number": update_number(title, url)}
 
-    # Le numéro d'Update le plus élevé est le plus récent.
-    articles.sort(
-        key=lambda article: article["number"],
-        reverse=True
-    )
-
-    return articles[0]
-
-
-async def get_article_text(url):
+async def article_text(url):
     html = await get_html(url)
     soup = BeautifulSoup(html, "html.parser")
-
-    article = (
-        soup.find("article")
-        or soup.find("main")
-        or soup.body
-    )
-
+    article = soup.find("article") or soup.find("main") or soup.body
     if not article:
-        raise Exception("Contenu de l'article Hutch introuvable.")
+        raise RuntimeError("Article Hutch introuvable.")
+    return "\n".join(x.strip() for x in article.get_text("\n", strip=True).splitlines() if x.strip())[:16000]
 
-    text = article.get_text("\n", strip=True)
+async def ai_format(title, text):
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return None
+    client = AsyncOpenAI(api_key=key)
+    prompt = f"""Tu es le bot communautaire premium F1 Clash d'un serveur Discord francophone.
+Analyse la publication officielle Hutch ci-dessous et produis un résumé en français.
 
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
+CLASSE UNE SEULE CATÉGORIE PRINCIPALE :
+🟥 IMPORTANT = changement majeur de gameplay, équilibrage ou économie
+🟧 ÉVÉNEMENT = événement, compétition, récompenses ou contenu temporaire
+🟨 PILOTE = nouveau pilote, pilote ou statistiques de pilote
+🟦 MISE À JOUR = patch notes, améliorations et corrections générales
+🟩 INFO = actualité générale ne correspondant pas aux catégories ci-dessus
 
-    return "\n".join(lines)[:15000]
+Réponds UNIQUEMENT avec ce format :
+[CATEGORIE]
+TITRE: titre français court
+RESUME: résumé en 2-4 phrases
+CHANGEMENTS:
+- point important
+- point important
+- point important
+A_RETENIR:
+- conseil ou information utile aux joueurs
+IMPORTANT: phrase courte indiquant si l'information peut avoir un impact sur la stratégie de jeu
 
-
-async def translate(text, title):
-
-    api_key = os.getenv("OPENAI_API_KEY")
-
-    # Pour tester le système avant d'activer la traduction.
-    if not api_key:
-
-        return (
-            f"🏎️ **{title}**\n\n"
-            "🇬🇧 Publication Hutch détectée avec succès !\n\n"
-            "🇫🇷 La traduction automatique sera activée "
-            "dans l'étape suivante.\n\n"
-            "🔗 Source officielle : Hutch"
-        )
-
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(api_key=api_key)
-
-    prompt = f"""
-Tu es le bot officiel F1 Clash de notre équipe Discord.
-
-Traduis et résume la publication Hutch ci-dessous en français.
-
-IMPORTANT :
-- N'invente aucune information.
-- Conserve les noms des pilotes, circuits, composants et fonctionnalités.
-- Sois clair et facile à lire sur Discord.
-- Ne fais pas un énorme pavé.
-- Mets en évidence ce qui peut intéresser les joueurs.
-
-Format :
-
-🏎️ **{title}**
-
-📰 **Résumé**
-
-🔧 **Changements importants**
-
-🎯 **À retenir pour notre équipe**
-
-Texte Hutch :
-
+N'invente rien. Conserve les noms propres et les chiffres.
+Titre original:
+{title}
+Publication Hutch:
 {text}
 """
+    response = await client.responses.create(model="gpt-5-mini", input=prompt)
+    return response.output_text.strip()[:5000]
 
-    response = await client.responses.create(
-        model="gpt-5-mini",
-        input=prompt
+def parse_ai(raw):
+    if not raw:
+        return {
+            "category": "🟦 MISE À JOUR",
+            "title": "Nouvelle publication Hutch",
+            "summary": "Une nouvelle publication Hutch a été détectée.",
+            "changes": [],
+            "takeaway": "Consultez l'article officiel pour les détails.",
+            "important": ""
+        }
+    cat = re.search(r"\[([^\]]+)\]", raw)
+    category_map = {
+        "IMPORTANT": "🟥 IMPORTANT",
+        "ÉVÉNEMENT": "🟧 ÉVÉNEMENT",
+        "EVENEMENT": "🟧 ÉVÉNEMENT",
+        "PILOTE": "🟨 PILOTE",
+        "MISE À JOUR": "🟦 MISE À JOUR",
+        "MISE A JOUR": "🟦 MISE À JOUR",
+        "INFO": "🟩 INFO",
+    }
+    category = category_map.get(cat.group(1).upper().strip(), "🟩 INFO") if cat else "🟩 INFO"
+
+    def field(name, next_names):
+        pattern = rf"{name}:\s*(.*?)(?=\n(?:{'|'.join(next_names)}):|\Z)"
+        m = re.search(pattern, raw, re.S | re.I)
+        return m.group(1).strip() if m else ""
+
+    changes_raw = field("CHANGEMENTS", ["A_RETENIR", "IMPORTANT"])
+    changes = [re.sub(r"^\s*[-•]\s*", "", x).strip() for x in changes_raw.splitlines() if x.strip()]
+    return {
+        "category": category,
+        "title": field("TITRE", ["RESUME"]) or "Nouvelle publication Hutch",
+        "summary": field("RESUME", ["CHANGEMENTS"]) or "Nouvelle publication Hutch détectée.",
+        "changes": changes[:6],
+        "takeaway": field("A_RETENIR", ["IMPORTANT"]),
+        "important": field("IMPORTANT", [])
+    }
+
+async def build_message(article):
+    text = await article_text(article["url"])
+    return parse_ai(await ai_format(article["title"], text))
+
+def make_embed(article, data):
+    description = f"📰 **Résumé**\n{data['summary']}\n\n"
+    if data["changes"]:
+        description += "🔧 **Changements importants**\n" + "\n".join(f"• {x}" for x in data["changes"]) + "\n\n"
+    if data["takeaway"]:
+        description += f"🎯 **À retenir**\n{data['takeaway']}\n\n"
+    if data["important"]:
+        description += f"⚡ **Impact**\n{data['important']}"
+    embed = discord.Embed(
+        title=f"{data['category']}  •  F1 CLASH",
+        description=description[:4096],
+        url=article["url"]
     )
+    embed.add_field(name="📌 Publication", value=data["title"][:1024], inline=False)
+    embed.set_footer(text=f"Hutch • Update {article['number']} • Traduction IA")
+    return embed
 
-    return response.output_text[:4000]
+async def process_latest():
+    article = await latest_article()
+    return article, await build_message(article)
 
-
-async def get_latest():
-
-    article = await find_latest_hutch_article()
-
-    text = await get_article_text(
-        article["url"]
-    )
-
-    message = await translate(
-        text,
-        article["title"]
-    )
-
-    return article, message
-
-
-@bot.tree.command(
-    name="news",
-    description="Récupère la dernière actualité Hutch F1 Clash"
-)
+@bot.tree.command(name="news", description="Récupère et traduit la dernière publication Hutch")
 async def news(interaction):
-
     await interaction.response.defer()
-
     try:
+        article, data = await process_latest()
+        await interaction.followup.send(embed=make_embed(article, data))
+    except Exception as e:
+        print("ERREUR /news:", repr(e))
+        await interaction.followup.send("❌ Impossible de récupérer ou traiter la publication Hutch. Consulte les logs Render.")
 
-        article, message = await get_latest()
-
-        embed = discord.Embed(
-            title="🇫🇷 F1 CLASH — ACTUALITÉ HUTCH",
-            description=message,
-            url=article["url"]
-        )
-
-        embed.set_footer(
-            text=f"Source Hutch • Update {article['number']}"
-        )
-
-        await interaction.followup.send(
-            embed=embed
-        )
-
-    except Exception as error:
-
-        print("ERREUR HUTCH :", repr(error))
-
-        await interaction.followup.send(
-            "❌ Impossible de récupérer Hutch actuellement."
-        )
-
-
-@bot.tree.command(
-    name="patch",
-    description="Récupère les dernières Patch Notes F1 Clash"
-)
+@bot.tree.command(name="patch", description="Récupère la dernière Patch Note F1 Clash")
 async def patch(interaction):
-
     await news(interaction)
 
-
 @tasks.loop(minutes=CHECK_MINUTES)
-async def automatic_hutch_check():
-
+async def hutch_check():
     try:
-
-        article = await find_latest_hutch_article()
-
+        article = await latest_article()
         state = load_state()
-
-        if state["last_url"] == article["url"]:
+        if state.get("last_url") == article["url"]:
             return
-
-        text = await get_article_text(
-            article["url"]
-        )
-
-        message = await translate(
-            text,
-            article["title"]
-        )
-
-        channel = bot.get_channel(
-            CHANNEL_ID
-        )
-
+        # L'IA n'est appelée qu'une fois lorsqu'une nouvelle publication est détectée.
+        data = await build_message(article)
+        channel = bot.get_channel(CHANNEL_ID)
         if channel:
-
-            embed = discord.Embed(
-                title="🚨 NOUVELLE INFORMATION F1 CLASH",
-                description=message,
-                url=article["url"]
-            )
-
-            embed.set_footer(
-                text=f"Hutch • Update {article['number']}"
-            )
-
-            await channel.send(
-                embed=embed
-            )
-
+            await channel.send(embed=make_embed(article, data))
             state["last_url"] = article["url"]
-
             save_state(state)
+            print("Nouvelle publication envoyée:", article["title"])
+    except Exception as e:
+        print("ERREUR SURVEILLANCE HUTCH:", repr(e))
 
-            print(
-                "Nouvelle publication Hutch envoyée :",
-                article["title"]
-            )
-
-    except Exception as error:
-
-        print(
-            "ERREUR SURVEILLANCE HUTCH :",
-            repr(error)
-        )
-
-
-@automatic_hutch_check.before_loop
+@hutch_check.before_loop
 async def before_check():
-
     await bot.wait_until_ready()
-
 
 @bot.event
 async def on_ready():
-
     try:
+        synced = await bot.tree.sync()
+        print(f"Commandes slash synchronisées: {len(synced)}")
+        for c in synced:
+            print("Commande:", "/" + c.name)
+    except Exception as e:
+        print("Erreur synchronisation:", repr(e))
+    print(f"Connecté en tant que {bot.user}")
+    if not hutch_check.is_running():
+        hutch_check.start()
 
-        commands_synced = await bot.tree.sync()
-
-        print(
-            f"{len(commands_synced)} commandes synchronisées."
-        )
-
-        for command in commands_synced:
-            print(
-                f"Commande disponible : /{command.name}"
-            )
-
-    except Exception as error:
-
-        print(
-            "Erreur synchronisation commandes :",
-            repr(error)
-        )
-
-    print(
-        f"Bot connecté : {bot.user}"
-    )
-
-    if not automatic_hutch_check.is_running():
-
-        automatic_hutch_check.start()
-
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not TOKEN:
-
-    raise RuntimeError(
-        "DISCORD_TOKEN n'est pas configuré."
-    )
-
-bot.run(TOKEN)
+token = os.getenv("DISCORD_TOKEN")
+if not token:
+    raise RuntimeError("DISCORD_TOKEN n'est pas configuré.")
+bot.run(token)
