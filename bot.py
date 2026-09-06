@@ -5,12 +5,12 @@ import aiohttp
 from bs4 import BeautifulSoup
 import discord
 from discord.ext import commands, tasks
-from openai import AsyncOpenAI
+from google import genai
 
 HUTCH_URL = "https://www.hutch.io/our-games/f1-clash/patch-notes/"
 STATE_FILE = "state.json"
-CHECK_MINUTES = int(os.getenv("CHECK_MINUTES", "10"))
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+CHECK_MINUTES = int(os.getenv("CHECK_MINUTES", "75"))
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -82,10 +82,10 @@ async def article_text(url):
     return "\n".join(x.strip() for x in article.get_text("\n", strip=True).splitlines() if x.strip())[:16000]
 
 async def ai_format(title, text):
-    key = os.getenv("OPENAI_API_KEY")
+    key = os.getenv("GEMINI_API_KEY")
     if not key:
         return None
-    client = AsyncOpenAI(api_key=key)
+    client = genai.Client(api_key=key)
     prompt = f"""Tu es le bot communautaire premium F1 Clash d'un serveur Discord francophone.
 Analyse la publication officielle Hutch ci-dessous et produis un résumé en français.
 
@@ -114,8 +114,12 @@ Titre original:
 Publication Hutch:
 {text}
 """
-    response = await client.responses.create(model="gpt-5-mini", input=prompt)
-    return response.output_text.strip()[:5000]
+    interaction = client.interactions.create(
+    model="gemini-3.6-flash",
+    input=prompt
+    )   
+
+    return interaction.output_text.strip()[:5000]
 
 def parse_ai(raw):
     if not raw:
@@ -187,7 +191,7 @@ async def news(interaction):
         article, data = await process_latest()
         await interaction.followup.send(embed=make_embed(article, data))
     except Exception as e:
-        print("ERREUR /news:", repr(e))
+        print("ERREUR /news:", str(e))
         await interaction.followup.send("❌ Impossible de récupérer ou traiter la publication Hutch. Consulte les logs Render.")
 
 @bot.tree.command(name="patch", description="Récupère la dernière Patch Note F1 Clash")
@@ -210,7 +214,7 @@ async def hutch_check():
             save_state(state)
             print("Nouvelle publication envoyée:", article["title"])
     except Exception as e:
-        print("ERREUR SURVEILLANCE HUTCH:", repr(e))
+        print("ERREUR SURVEILLANCE HUTCH:", str(e))
 
 @hutch_check.before_loop
 async def before_check():
@@ -233,3 +237,4 @@ token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("DISCORD_TOKEN n'est pas configuré.")
 bot.run(token)
+
